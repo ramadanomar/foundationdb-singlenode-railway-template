@@ -69,9 +69,20 @@ yourself.
 | `FDB_CLUSTER_ID` | _generated_ | Cluster identifier in the connection string. Stable for the life of the service. |
 | `FDB_STORAGE_ENGINE` | `ssd-2` | FDB storage engine used at `configure new`. Only takes effect on first boot. |
 | `FDB_PROCESS_CLASS` | `unset` | FDB process class (`unset` is correct for a single-process node). |
-| `FDB_COORDINATOR_HOSTNAME` | `${{RAILWAY_PRIVATE_DOMAIN}}` | Hostname written into the cluster file so clients can resolve the coordinator by DNS. |
+| `FDB_COORDINATOR_HOSTNAME` | `${{RAILWAY_PRIVATE_DOMAIN}}` | Hostname exported to clients so they can reach the coordinator over private DNS. Not used by the server itself. |
 | `RAILWAY_RUN_UID` | `0` | Required so the persistent volume (mounted as root) is writable. |
 | `FDB_CONNECTION_STRING` | _computed_ | Full cluster string clients should use as `FDB_CLUSTER_FILE_CONTENTS`. |
+| `FDB_BOOTSTRAP_WAIT_SECS` | `8` | How long the entrypoint waits for `fdbserver` to settle before running `configure new` on a fresh volume. |
+| `FDB_FORCE_INIT` | `0` | Set to `1` to wipe `/var/fdb/data` and bootstrap a fresh database on the next boot. **Data is destroyed.** |
+
+## Why the cluster file uses an IP, not a hostname
+
+`fdbserver` only recognises itself as a coordinator when the address in its
+cluster file matches its `--public-address`. Railway gives each container a
+fresh IPv4 on every boot, so the entrypoint rewrites the cluster file with the
+current IP on each start. Clients in the same project don't read that file —
+they get `FDB_CONNECTION_STRING` (which uses the private DNS hostname) as a
+Railway reference variable and resolve it themselves.
 
 ## Connecting from another Railway service
 
