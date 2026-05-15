@@ -104,60 +104,55 @@ has_storage_files() {
 bootstrap_watchdog() {
     local marker="${FDB_DATA_DIR}/.fdb-bootstrapped"
 
-    log "[bootstrap] waiting for fdbserver to respond to fdbcli"
-    local out=""
-    local responsive=0
-    local i
-    for i in $(seq 1 90); do
-        sleep 1
-        if ! kill -0 "$FDB_PID" 2>/dev/null; then
-            log "[bootstrap] ABORT: fdbserver died (pid ${FDB_PID} gone)"
-            return 1
-        fi
-        out="$(fdbcli -C "$LOCAL_CLUSTER_FILE" --exec 'status minimal' --timeout 5 2>&1 || true)"
-        case "$out" in
-            *"The database is available"*|*"Database is available"*|*"The database is unavailable"*|*"Database is unavailable"*)
-                responsive=1
-                log "[bootstrap] fdbserver responsive after ${i}s"
-                log "[bootstrap] status: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g')"
-                break
-                ;;
-        esac
-        if (( i % 10 == 0 )); then
-            log "[bootstrap] poll ${i}s — fdbcli: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g')"
-        fi
-    done
+    log "[bootstrap] sleeping 8s to let fdbserver finish initialisation"
+    sleep 8
 
-    if [[ "$responsive" -eq 0 ]]; then
-        log "[bootstrap] WARNING: fdbserver did not become responsive in 90s"
-        log "[bootstrap] last fdbcli output: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g')"
+    if ! kill -0 "$FDB_PID" 2>/dev/null; then
+        log "[bootstrap] ABORT: fdbserver died"
         return 1
     fi
 
-    if echo "$out" | grep -qE "(Database is available|database is available)"; then
-        log "[bootstrap] database already initialised; marking bootstrapped"
+    log "[bootstrap] diagnostics:"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tlnp 2>&1 | sed 's/^/[ss] /'
+    fi
+    if command -v nc >/dev/null 2>&1; then
+        log "[bootstrap] nc -zv 127.0.0.1 ${FDB_PORT}:"
+        nc -zv -w 3 127.0.0.1 "${FDB_PORT}" 2>&1 | sed 's/^/[nc-lo] /' || true
+        log "[bootstrap] nc -zv ${CURRENT_IP} ${FDB_PORT}:"
+        nc -zv -w 3 "${CURRENT_IP}" "${FDB_PORT}" 2>&1 | sed 's/^/[nc-ip] /' || true
+    fi
+
+    log "[bootstrap] one-shot fdbcli status (long timeout) via local cluster file:"
+    fdbcli -C "$LOCAL_CLUSTER_FILE" --exec 'status minimal' --timeout 30 2>&1 | sed 's/^/[fdbcli A] /' || true
+
+    log "[bootstrap] one-shot fdbcli status (long timeout) via canonical cluster file:"
+    fdbcli -C "$FDB_CLUSTER_FILE" --exec 'status minimal' --timeout 30 2>&1 | sed 's/^/[fdbcli B] /' || true
+
+    if has_storage_files; then
+        log "[bootstrap] storage files exist on volume; treating as initialised"
         touch "$marker"
         return 0
     fi
 
-    if has_storage_files && [[ "$FDB_FORCE_INIT" != "1" ]]; then
-        log "[bootstrap] REFUSING to configure new: storage files exist but DB is unavailable."
-        log "[bootstrap] This usually means a previous bootstrap was interrupted."
-        log "[bootstrap] Set FDB_FORCE_INIT=1 to wipe and re-bootstrap (DATA WILL BE LOST)."
-        return 1
-    fi
-
-    log "[bootstrap] configuring new single ${FDB_STORAGE_ENGINE}"
-    if fdbcli -C "$LOCAL_CLUSTER_FILE" --exec "configure new single ${FDB_STORAGE_ENGINE}" --timeout 60 2>&1 \
+    log "[bootstrap] no storage files; running configure new single ${FDB_STORAGE_ENGINE} (via local cluster file)"
+    if fdbcli -C "$LOCAL_CLUSTER_FILE" --exec "configure new single ${FDB_STORAGE_ENGINE}" --timeout 120 2>&1 \
             | sed 's/^/[fdbcli configure] /'; then
         touch "$marker"
         log "[bootstrap] complete"
     else
-        log "[bootstrap] WARNING: configure new failed; will retry on next boot"
+        log "[bootstrap] WARNING: configure new failed via local; trying canonical cluster file"
+        if fdbcli -C "$FDB_CLUSTER_FILE" --exec "configure new single ${FDB_STORAGE_ENGINE}" --timeout 120 2>&1 \
+                | sed 's/^/[fdbcli configure B] /'; then
+            touch "$marker"
+            log "[bootstrap] complete via canonical cluster file"
+        else
+            log "[bootstrap] FAILED: both bootstrap attempts failed"
+        fi
     fi
 
-    log "[bootstrap] post-configure status:"
-    fdbcli -C "$LOCAL_CLUSTER_FILE" --exec 'status' --timeout 10 2>&1 | sed 's/^/[fdbcli status] /' || true
+    log "[bootstrap] final status:"
+    fdbcli -C "$LOCAL_CLUSTER_FILE" --exec 'status' --timeout 15 2>&1 | sed 's/^/[fdbcli final] /' || true
 }
 
 bootstrap_watchdog &
