@@ -9,7 +9,7 @@ set -euo pipefail
 : "${FDB_CLUSTER_ID:=railway}"
 : "${FDB_STORAGE_ENGINE:=ssd-2}"
 : "${FDB_PROCESS_CLASS:=unset}"
-: "${FDB_COORDINATOR_HOSTNAME:=${RAILWAY_PRIVATE_DOMAIN:-}}"
+: "${FDB_COORDINATOR_HOSTNAME:=}"
 
 mkdir -p "$FDB_DATA_DIR" "$FDB_LOG_DIR"
 chmod 700 "$FDB_DATA_DIR"
@@ -36,12 +36,10 @@ if [[ -z "$CURRENT_IP" ]]; then
     exit 1
 fi
 
+COORD_ADDR="${CURRENT_IP}:${FDB_PORT}"
+echo "[entrypoint] server cluster file uses IP: $COORD_ADDR"
 if [[ -n "$FDB_COORDINATOR_HOSTNAME" ]]; then
-    COORD_ADDR="${FDB_COORDINATOR_HOSTNAME}:${FDB_PORT}"
-    echo "[entrypoint] using hostname in cluster file: $COORD_ADDR"
-else
-    COORD_ADDR="${CURRENT_IP}:${FDB_PORT}"
-    echo "[entrypoint] using IP in cluster file: $COORD_ADDR"
+    echo "[entrypoint] FDB_COORDINATOR_HOSTNAME=$FDB_COORDINATOR_HOSTNAME is exported for clients only"
 fi
 
 CLUSTER_STRING="${FDB_CLUSTER_DESCRIPTION}:${FDB_CLUSTER_ID}@${COORD_ADDR}"
@@ -60,9 +58,20 @@ fdbserver \
     --locality-machineid "$(hostname)" \
     --class "${FDB_PROCESS_CLASS}" \
     --cluster-file "${FDB_CLUSTER_FILE}" \
-    --knob_disable_posix_kernel_aio=1 &
+    --knob_disable_posix_kernel_aio=1 2>&1 &
 
 FDB_PID=$!
+sleep 2
+if ! kill -0 "${FDB_PID}" 2>/dev/null; then
+    echo "[entrypoint] ERROR: fdbserver exited immediately (pid ${FDB_PID})" >&2
+    echo "[entrypoint] dumping fdbserver log files from ${FDB_LOG_DIR}:" >&2
+    ls -la "${FDB_LOG_DIR}" >&2 || true
+    for f in "${FDB_LOG_DIR}"/*; do
+        [[ -f "$f" ]] && { echo "----- $f -----" >&2; tail -n 200 "$f" >&2; }
+    done
+    exit 1
+fi
+echo "[entrypoint] fdbserver pid=${FDB_PID} is alive after 2s"
 
 term() {
     echo "[entrypoint] caught signal, stopping fdbserver (pid ${FDB_PID})"
