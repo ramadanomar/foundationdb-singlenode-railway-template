@@ -60,6 +60,17 @@ CLUSTER_STRING="${FDB_CLUSTER_DESCRIPTION}:${FDB_CLUSTER_ID}@${COORD_ADDR}"
 echo "$CLUSTER_STRING" > "$FDB_CLUSTER_FILE"
 log "cluster file ${FDB_CLUSTER_FILE}: ${CLUSTER_STRING}"
 
+# Some container networks (including Railway's wireguard mesh) do not route
+# packets from inside the container to the container's own assigned IP via the
+# kernel loopback. fdbcli would then time out trying to reach fdbserver via the
+# IP in $FDB_CLUSTER_FILE. We work around that by giving local fdbcli calls a
+# second cluster file pointing at 127.0.0.1 — same cluster_id, so the handshake
+# with fdbserver still succeeds.
+LOCAL_CLUSTER_FILE=/tmp/fdb-local.cluster
+LOCAL_CLUSTER_STRING="${FDB_CLUSTER_DESCRIPTION}:${FDB_CLUSTER_ID}@127.0.0.1:${FDB_PORT}"
+echo "$LOCAL_CLUSTER_STRING" > "$LOCAL_CLUSTER_FILE"
+log "local cluster file ${LOCAL_CLUSTER_FILE}: ${LOCAL_CLUSTER_STRING}"
+
 log "starting fdbserver listen=0.0.0.0:${FDB_PORT} public=${PUBLIC_ADDR}"
 
 fdbserver \
@@ -103,7 +114,7 @@ bootstrap_watchdog() {
             log "[bootstrap] ABORT: fdbserver died (pid ${FDB_PID} gone)"
             return 1
         fi
-        out="$(fdbcli -C "$FDB_CLUSTER_FILE" --exec 'status minimal' --timeout 5 2>&1 || true)"
+        out="$(fdbcli -C "$LOCAL_CLUSTER_FILE" --exec 'status minimal' --timeout 5 2>&1 || true)"
         case "$out" in
             *"The database is available"*|*"Database is available"*|*"The database is unavailable"*|*"Database is unavailable"*)
                 responsive=1
@@ -137,7 +148,7 @@ bootstrap_watchdog() {
     fi
 
     log "[bootstrap] configuring new single ${FDB_STORAGE_ENGINE}"
-    if fdbcli -C "$FDB_CLUSTER_FILE" --exec "configure new single ${FDB_STORAGE_ENGINE}" --timeout 60 2>&1 \
+    if fdbcli -C "$LOCAL_CLUSTER_FILE" --exec "configure new single ${FDB_STORAGE_ENGINE}" --timeout 60 2>&1 \
             | sed 's/^/[fdbcli configure] /'; then
         touch "$marker"
         log "[bootstrap] complete"
@@ -146,7 +157,7 @@ bootstrap_watchdog() {
     fi
 
     log "[bootstrap] post-configure status:"
-    fdbcli -C "$FDB_CLUSTER_FILE" --exec 'status' --timeout 10 2>&1 | sed 's/^/[fdbcli status] /' || true
+    fdbcli -C "$LOCAL_CLUSTER_FILE" --exec 'status' --timeout 10 2>&1 | sed 's/^/[fdbcli status] /' || true
 }
 
 bootstrap_watchdog &
