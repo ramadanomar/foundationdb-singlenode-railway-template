@@ -10,11 +10,22 @@ set -euo pipefail
 : "${FDB_STORAGE_ENGINE:=ssd-2}"
 : "${FDB_PROCESS_CLASS:=unset}"
 : "${FDB_COORDINATOR_HOSTNAME:=}"
+: "${FDB_FORCE_INIT:=0}"
 
 log() { echo "[entrypoint] $*"; }
 
 mkdir -p "$FDB_DATA_DIR" "$FDB_LOG_DIR"
+
+if [[ "$FDB_FORCE_INIT" == "1" ]]; then
+    log "FDB_FORCE_INIT=1; wiping ${FDB_DATA_DIR} before start"
+    find "$FDB_DATA_DIR" -mindepth 1 -delete || true
+    mkdir -p "$FDB_LOG_DIR"
+fi
+
 chmod 700 "$FDB_DATA_DIR"
+
+log "data dir contents at start:"
+ls -la "$FDB_DATA_DIR" | sed 's/^/[ls] /'
 
 get_ipv4() {
     local ip
@@ -39,31 +50,16 @@ if [[ -z "$CURRENT_IP" ]]; then
 fi
 
 COORD_ADDR="${CURRENT_IP}:${FDB_PORT}"
+PUBLIC_ADDR="${CURRENT_IP}:${FDB_PORT}"
 log "server cluster file uses IP: $COORD_ADDR"
 if [[ -n "$FDB_COORDINATOR_HOSTNAME" ]]; then
-    log "FDB_COORDINATOR_HOSTNAME=$FDB_COORDINATOR_HOSTNAME is exported for clients only"
+    log "FDB_COORDINATOR_HOSTNAME=$FDB_COORDINATOR_HOSTNAME (exported for clients only)"
 fi
 
 CLUSTER_STRING="${FDB_CLUSTER_DESCRIPTION}:${FDB_CLUSTER_ID}@${COORD_ADDR}"
 echo "$CLUSTER_STRING" > "$FDB_CLUSTER_FILE"
 log "cluster file ${FDB_CLUSTER_FILE}: ${CLUSTER_STRING}"
 
-# Detect a previously initialised database via the FDB storage engine files
-# the server leaves on the volume. This is a safety net independent of our
-# bootstrap marker so we never run "configure new" on top of real data.
-db_already_initialised() {
-    local found
-    found=$(find "$FDB_DATA_DIR" -maxdepth 2 -type f \( \
-        -name 'storage-*.sqlite' -o \
-        -name 'storage-*.fdb-c' -o \
-        -name 'coordination-*.sqlite' -o \
-        -name 'log-*.sqlite' -o \
-        -name 'logqueue-*.fdb-c' \
-    \) 2>/dev/null | head -n1)
-    [[ -n "$found" ]]
-}
-
-PUBLIC_ADDR="${CURRENT_IP}:${FDB_PORT}"
 log "starting fdbserver listen=0.0.0.0:${FDB_PORT} public=${PUBLIC_ADDR}"
 
 fdbserver \
@@ -89,26 +85,19 @@ term() {
 }
 trap term TERM INT
 
-# Background bootstrap watchdog: when fdbserver is reachable, configure the DB
-# if it has never been initialised on this volume, then exit. Runs in the
-# background so we can hand off PID 1 to `wait` on fdbserver.
+has_storage_files() {
+    find "$FDB_DATA_DIR" -maxdepth 2 -type f -name 'storage-*.sqlite' 2>/dev/null \
+        | head -n1 | grep -q .
+}
+
 bootstrap_watchdog() {
     local marker="${FDB_DATA_DIR}/.fdb-bootstrapped"
 
-    if db_already_initialised; then
-        log "[bootstrap] storage files exist on volume; treating database as initialised"
-        touch "$marker"
-        return 0
-    fi
-    if [[ -f "$marker" ]]; then
-        log "[bootstrap] marker present; nothing to do"
-        return 0
-    fi
-
-    log "[bootstrap] waiting for fdbserver to accept fdbcli connections"
+    log "[bootstrap] waiting for fdbserver to respond to fdbcli"
     local out=""
+    local responsive=0
     local i
-    for i in $(seq 1 60); do
+    for i in $(seq 1 90); do
         sleep 1
         if ! kill -0 "$FDB_PID" 2>/dev/null; then
             log "[bootstrap] ABORT: fdbserver died (pid ${FDB_PID} gone)"
@@ -116,37 +105,52 @@ bootstrap_watchdog() {
         fi
         out="$(fdbcli -C "$FDB_CLUSTER_FILE" --exec 'status minimal' --timeout 5 2>&1 || true)"
         case "$out" in
-            *"The database is available"*|*"Database is available"*)
-                log "[bootstrap] DB already available (poll $i); marking bootstrapped"
-                touch "$marker"
-                return 0
-                ;;
-            *"The database is unavailable"*|*"Database is unavailable"*|*"unconfigured"*|*"not yet configured"*|*"new database"*)
-                log "[bootstrap] DB reachable but unconfigured (poll $i); proceeding to configure"
+            *"The database is available"*|*"Database is available"*|*"The database is unavailable"*|*"Database is unavailable"*)
+                responsive=1
+                log "[bootstrap] fdbserver responsive after ${i}s"
+                log "[bootstrap] status: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g')"
                 break
                 ;;
         esac
-        if (( i % 5 == 0 )); then
-            log "[bootstrap] poll $i fdbcli output: ${out//$'\n'/ | }"
+        if (( i % 10 == 0 )); then
+            log "[bootstrap] poll ${i}s — fdbcli: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g')"
         fi
     done
 
-    log "[bootstrap] running: configure new single ${FDB_STORAGE_ENGINE}"
+    if [[ "$responsive" -eq 0 ]]; then
+        log "[bootstrap] WARNING: fdbserver did not become responsive in 90s"
+        log "[bootstrap] last fdbcli output: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g')"
+        return 1
+    fi
+
+    if echo "$out" | grep -qE "(Database is available|database is available)"; then
+        log "[bootstrap] database already initialised; marking bootstrapped"
+        touch "$marker"
+        return 0
+    fi
+
+    if has_storage_files && [[ "$FDB_FORCE_INIT" != "1" ]]; then
+        log "[bootstrap] REFUSING to configure new: storage files exist but DB is unavailable."
+        log "[bootstrap] This usually means a previous bootstrap was interrupted."
+        log "[bootstrap] Set FDB_FORCE_INIT=1 to wipe and re-bootstrap (DATA WILL BE LOST)."
+        return 1
+    fi
+
+    log "[bootstrap] configuring new single ${FDB_STORAGE_ENGINE}"
     if fdbcli -C "$FDB_CLUSTER_FILE" --exec "configure new single ${FDB_STORAGE_ENGINE}" --timeout 60 2>&1 \
-            | sed 's/^/[fdbcli] /'; then
+            | sed 's/^/[fdbcli configure] /'; then
         touch "$marker"
         log "[bootstrap] complete"
     else
         log "[bootstrap] WARNING: configure new failed; will retry on next boot"
     fi
 
-    log "[bootstrap] final status:"
-    fdbcli -C "$FDB_CLUSTER_FILE" --exec 'status' --timeout 10 2>&1 | sed 's/^/[fdbcli] /' || true
+    log "[bootstrap] post-configure status:"
+    fdbcli -C "$FDB_CLUSTER_FILE" --exec 'status' --timeout 10 2>&1 | sed 's/^/[fdbcli status] /' || true
 }
 
 bootstrap_watchdog &
 
-# Wait for fdbserver to exit, then propagate its status as our own.
 set +e
 wait "${FDB_PID}"
 FDB_RC=$?
@@ -154,12 +158,12 @@ set -e
 
 log "fdbserver exited with status ${FDB_RC}"
 if [[ "${FDB_RC}" -ne 0 ]]; then
-    log "dumping recent fdbserver log files from ${FDB_LOG_DIR}:"
-    ls -la "${FDB_LOG_DIR}" 2>/dev/null || true
+    log "fdbserver log dir contents:"
+    ls -la "${FDB_LOG_DIR}" 2>/dev/null | sed 's/^/[ls] /' || true
     for f in "${FDB_LOG_DIR}"/*.xml "${FDB_LOG_DIR}"/*.json; do
         [[ -f "$f" ]] || continue
         echo "----- $f -----"
-        tail -n 100 "$f"
+        tail -n 80 "$f"
     done
 fi
 exit "${FDB_RC}"
