@@ -115,17 +115,18 @@ log "cluster file ${FDB_CLUSTER_FILE}: ${CLUSTER_STRING}"
 LOCAL_CLUSTER_FILE=/tmp/fdb-local.cluster
 echo "${FDB_CLUSTER_DESCRIPTION}:${FDB_CLUSTER_ID}@127.0.0.1:${FDB_PUBLIC_PORT}" > "$LOCAL_CLUSTER_FILE"
 
-SOCAT_PID=""
+BRIDGE_PID=""
 if [[ "$FDB_MODE" == "external" && "$FDB_PUBLIC_PORT" != "$FDB_PORT" ]]; then
-    # fdbserver listens on $FDB_PORT but advertises the proxy port as its
-    # canonical port. Local fdbcli has to dial the canonical port or FDB's
-    # handshake assertion fires. Bridge it with socat on loopback.
-    log "starting socat bridge: 127.0.0.1:${FDB_PUBLIC_PORT} -> 127.0.0.1:${FDB_PORT}"
-    socat "TCP-LISTEN:${FDB_PUBLIC_PORT},bind=127.0.0.1,fork,reuseaddr" \
-          "TCP:127.0.0.1:${FDB_PORT}" \
-          > >(stdbuf -oL sed 's/^/[socat] /') 2>&1 &
-    SOCAT_PID=$!
-    log "socat pid=${SOCAT_PID}"
+    # fdbserver listens on $FDB_PORT but advertises $FDB_PUBLIC_PORT as its
+    # canonical port. In-container fdbcli has to dial the canonical port or
+    # FDB's handshake assertion fires. ncat bridges them on loopback.
+    log "starting ncat bridge: 127.0.0.1:${FDB_PUBLIC_PORT} -> 127.0.0.1:${FDB_PORT}"
+    ncat --listen 127.0.0.1 "${FDB_PUBLIC_PORT}" \
+         --keep-open \
+         --sh-exec "ncat 127.0.0.1 ${FDB_PORT}" \
+         > >(stdbuf -oL sed 's/^/[ncat] /') 2>&1 &
+    BRIDGE_PID=$!
+    log "ncat pid=${BRIDGE_PID}"
 fi
 
 if [[ -n "$FDB_COORDINATOR_HOSTNAME" ]]; then
@@ -152,7 +153,7 @@ log "fdbserver pid=${FDB_PID}"
 term() {
     log "caught signal, stopping fdbserver (pid ${FDB_PID})"
     kill -TERM "${FDB_PID}" 2>/dev/null || true
-    [[ -n "${SOCAT_PID}" ]] && kill -TERM "${SOCAT_PID}" 2>/dev/null || true
+    [[ -n "${BRIDGE_PID}" ]] && kill -TERM "${BRIDGE_PID}" 2>/dev/null || true
     wait "${FDB_PID}" 2>/dev/null || true
     exit 0
 }
