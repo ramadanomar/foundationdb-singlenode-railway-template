@@ -40,14 +40,18 @@ Railway's private network so other services in the same project can connect.
 The container runs a single `fdbserver` process and uses an SSD storage engine
 (`ssd-2`). On every boot the entrypoint:
 
-1. Discovers its current container IPv4 address.
-2. Writes a fresh `fdb.cluster` file at `${FDB_CLUSTER_FILE}` pointing at the
-   service's Railway private hostname (`${RAILWAY_PRIVATE_DOMAIN}:4500`), so
-   clients can resolve the coordinator via internal DNS.
-3. Starts `fdbserver` listening on `0.0.0.0:4500`, public address set to the
-   current container IP.
-4. On the very first boot only (detected via a `.fdb-bootstrapped` marker on the
-   volume), runs `configure new single ssd-2` to initialise the database.
+1. Determines `FDB_MODE` (`internal` or `external`, see below).
+2. Resolves the public address to an IP and writes a fresh `fdb.cluster` file
+   at `${FDB_CLUSTER_FILE}` whose coordinator address matches the value passed
+   to `fdbserver --public-address`.
+3. Starts `fdbserver` listening on `0.0.0.0:${FDB_PORT}` with the chosen
+   public address.
+4. In external mode, starts a loopback `socat` bridge so the in-container
+   `fdbcli` can dial the same canonical port the server advertises (FDB's
+   wire-level handshake compares ports verbatim).
+5. On the very first boot only (detected by the presence of
+   `storage-*.sqlite` files on the volume), runs `configure new single ssd-2`
+   to initialise the database.
 
 The bootstrap marker lives on the persistent volume, so subsequent restarts —
 or even container replacements — never re-run `configure new` and never wipe
@@ -60,29 +64,54 @@ networking, and an optional TCP proxy in front of the database — without you
 needing to write Compose files, manage volumes by hand, or expose the port
 yourself.
 
+## Modes: `internal` vs `external`
+
+FoundationDB embeds a single canonical address (host + port) in every
+wire-level handshake packet. Clients refuse the session when the port they
+dialed does not match the canonical port the server advertised. Railway's TCP
+proxy translates ports (`external:11333 → container:4500`), so the server's
+`--public-address` has to match the side you actually want clients to use.
+You cannot satisfy both internal *and* external clients from a single
+`fdbserver` process; pick one.
+
+The entrypoint chooses a mode automatically:
+
+- If `RAILWAY_TCP_PROXY_DOMAIN` and `RAILWAY_TCP_PROXY_PORT` are set
+  (i.e. the Railway TCP proxy is enabled on this service), `FDB_MODE=external`.
+- Otherwise, `FDB_MODE=internal`.
+
+Set `FDB_MODE` explicitly to override the auto-detection. The active value is
+exported to the container's environment and printed in the boot logs, so
+`printenv FDB_MODE` inside the container always tells you which mode is live.
+
+| Mode | `--public-address` | Cluster string clients use | Who can connect |
+| --- | --- | --- | --- |
+| `internal` | container-IP:`FDB_PORT` | `…@${{RAILWAY_PRIVATE_DOMAIN}}:${{FDB_PORT}}` | Railway services in the same project only |
+| `external` | proxy-IP:`RAILWAY_TCP_PROXY_PORT` | `…@${{RAILWAY_TCP_PROXY_DOMAIN}}:${{RAILWAY_TCP_PROXY_PORT}}` | Anyone with the cluster string (internal services connect via the proxy) |
+
+External mode is the right default for templates because it works for both
+external clients and internal clients (the latter hairpin through the proxy,
+which adds latency and counts as egress bandwidth). Switch to `internal` if
+all your clients live in the same Railway project and you want direct,
+in-network traffic.
+
 ## Variables
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `FDB_PORT` | `4500` | Port `fdbserver` listens on |
+| `FDB_MODE` | _auto_ | `external` if Railway TCP proxy is on, else `internal`. Set explicitly to override. |
+| `FDB_PUBLIC_HOST` | _auto_ | Host advertised to clients. In external mode defaults to `${{RAILWAY_TCP_PROXY_DOMAIN}}`. |
+| `FDB_PUBLIC_PORT` | _auto_ | Port advertised to clients. In external mode defaults to `${{RAILWAY_TCP_PROXY_PORT}}`. |
+| `FDB_PORT` | `4500` | Port `fdbserver` actually listens on inside the container. |
 | `FDB_CLUSTER_DESCRIPTION` | _generated_ | Cluster name in the connection string. Stable for the life of the service. |
 | `FDB_CLUSTER_ID` | _generated_ | Cluster identifier in the connection string. Stable for the life of the service. |
 | `FDB_STORAGE_ENGINE` | `ssd-2` | FDB storage engine used at `configure new`. Only takes effect on first boot. |
 | `FDB_PROCESS_CLASS` | `unset` | FDB process class (`unset` is correct for a single-process node). |
-| `FDB_COORDINATOR_HOSTNAME` | `${{RAILWAY_PRIVATE_DOMAIN}}` | Hostname exported to clients so they can reach the coordinator over private DNS. Not used by the server itself. |
+| `FDB_COORDINATOR_HOSTNAME` | `${{RAILWAY_PRIVATE_DOMAIN}}` | Informational only; exported for clients that prefer the private name. |
 | `RAILWAY_RUN_UID` | `0` | Required so the persistent volume (mounted as root) is writable. |
 | `FDB_CONNECTION_STRING` | _computed_ | Full cluster string clients should use as `FDB_CLUSTER_FILE_CONTENTS`. |
 | `FDB_BOOTSTRAP_WAIT_SECS` | `8` | How long the entrypoint waits for `fdbserver` to settle before running `configure new` on a fresh volume. |
 | `FDB_FORCE_INIT` | `0` | Set to `1` to wipe `/var/fdb/data` and bootstrap a fresh database on the next boot. **Data is destroyed.** |
-
-## Why the cluster file uses an IP, not a hostname
-
-`fdbserver` only recognises itself as a coordinator when the address in its
-cluster file matches its `--public-address`. Railway gives each container a
-fresh IPv4 on every boot, so the entrypoint rewrites the cluster file with the
-current IP on each start. Clients in the same project don't read that file —
-they get `FDB_CONNECTION_STRING` (which uses the private DNS hostname) as a
-Railway reference variable and resolve it themselves.
 
 ## Connecting from another Railway service
 
@@ -113,12 +142,18 @@ Java — all use the same cluster-file mechanism.
 
 ## Connecting from outside Railway
 
-Enable a TCP proxy on the service:
+Requires `FDB_MODE=external` (the default when the Railway TCP proxy is
+enabled on the service):
 
 1. Open the service in the Railway dashboard.
-2. Settings → Networking → TCP Proxy → set port `4500`.
-3. Railway gives you a public proxy host and port (e.g. `shuttle.proxy.rlwy.net:30123`).
-4. Construct a cluster string for clients: `${FDB_CLUSTER_DESCRIPTION}:${FDB_CLUSTER_ID}@<proxy-host>:<proxy-port>`.
+2. Settings → Networking → TCP Proxy → set target port `4500`.
+3. Railway gives you a public proxy host and port
+   (e.g. `shuttle.proxy.rlwy.net:30123`).
+4. Construct a cluster string for clients:
+   `${FDB_CLUSTER_DESCRIPTION}:${FDB_CLUSTER_ID}@<proxy-host>:<proxy-port>`.
+
+If you change the Railway TCP proxy port after first boot, redeploy the
+service so the entrypoint re-reads it and re-writes the cluster file.
 
 ## Resources
 

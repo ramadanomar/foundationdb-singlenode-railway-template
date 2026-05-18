@@ -1,8 +1,12 @@
 FROM foundationdb/foundationdb:7.3.63
 
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-
 USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends socat \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV FDB_PORT=4500 \
